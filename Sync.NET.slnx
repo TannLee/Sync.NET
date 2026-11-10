@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Sync.NET/Sync.NET.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Sync.NET.IntegrationTests/Sync.NET.IntegrationTests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Sync.NET.Feasibility/Sync.NET.Feasibility.csproj" />
+  </Folder>
+</Solution>
