@@ -14,6 +14,12 @@ Kiểm chứng ngày 2026-11-10 trên Windows x64 với .NET SDK 10.0.402, runti
 | Hai replica Wasm, push/pull và conflict | PASS | Push 3 thay đổi offline sau khi mở lại, pull delta 2 upserts và 1 delete. Push hỗn hợp gửi 2 thao tác, trả 1 applied và 1 conflict. Refusal giữ nguyên sau reopen, push kế tiếp gửi 0 thao tác. |
 | Push giao dịch trên một bảng | PASS | Khi một thao tác xung đột, cả nhóm 2 thao tác bị từ chối. Nhóm hợp lệ ghi cả 2 hàng cùng version. |
 | Push giao dịch trên hai bảng | PASS | Push từ một bảng gửi cả nhóm. Nhóm xung đột không ghi hàng ở bảng nào. Nhóm hợp lệ ghi hai hàng cùng version. |
+| Giao dịch cha–con có khóa ngoại | PASS | Push từ bảng con gửi cả cha lẫn con. Nếu cha bị xóa trên server trước push, cả nhóm bị từ chối với `fk_parent_missing`. |
+| Checkpoint khi pull bị ngắt | PASS | Chặn frame dữ liệu, mở lại replica thấy dữ liệu và token cũ. Pull tiếp từ token cũ nhận 1 upsert và 1 delete. Dữ liệu mới và token mới còn sau reopen. |
+| Checkpoint sau khi nhận một phần live stream | PASS | Áp dụng frame đầu, chặn frame kế tiếp. Reopen giữ dữ liệu và token của frame đầu. Pull tiếp nhận đúng thay đổi còn thiếu. |
+| Delta có bộ lọc | PASS | Một hàng vào và một hàng rời bộ lọc. Delta báo 1 upsert, 1 delete và cache sau reopen chỉ còn hàng đúng phạm vi. |
+| Pull one-shot nhiều trang | CHƯA CHẠY | Đã thêm probe chặn trang dữ liệu thứ hai, mở lại và đối chiếu toàn bộ hàng. |
+| Checkpoint hết hạn | CHƯA CHẠY | Đã thêm probe với server retention riêng và xác nhận commit cũ hết hạn trước khi kiểm tra cache. |
 | Replay sau mất phản hồi | PASS | Chặn phản hồi WebSocket, kill tiến trình gửi push khi database còn mở, xác nhận server đã commit rồi mở replica trong tiến trình khác để retry. Outcome báo replayed và không phát sinh delta mới. |
 
 Kết quả restart áp dụng cho đóng tiến trình có kiểm soát, với cấu hình Wasm `durability: 'commit'`. Chưa thử kill đột ngột, mất điện, lỗi đĩa hoặc khôi phục pending writes. `ILocalSql` là interface thử nghiệm cho một batch SQL, với mỗi lệnh commit riêng. Console và test dùng cùng kịch bản. Probe không có hợp đồng sync hoặc outbox riêng.
@@ -87,11 +93,34 @@ Probe dùng bảng tên ngẫu nhiên, hai thư mục replica và dữ liệu t�
 
 Probe cũng gửi hai giao dịch trên cùng bảng. Với giao dịch có xung đột, server trả `conflict` cho bản sửa và `rejected` cho insert đi cùng, không ghi hàng nào trong nhóm. Cả hai mục xuất hiện trong `refused()`. Với giao dịch hợp lệ, cả hai insert được áp dụng cùng version.
 
-Với giao dịch trên hai bảng đã sync, một lần `push()` từ bảng chính gửi cả hai thao tác. Bản sửa stale làm cả nhóm bị từ chối, bảng còn lại không có hàng mới. Với nhóm hợp lệ, mỗi bảng nhận một hàng và cả hai outcome có cùng version. Push tiếp từ bảng còn lại gửi 0 thao tác trong cả hai trường hợp. Kịch bản hai bảng chưa bao phủ ràng buộc khóa ngoại.
+Với hai bảng đã sync có khóa ngoại, push từ bảng cha gửi cả nhóm có bản sửa stale và server từ chối cả hai thao tác. Nhóm hợp lệ tạo cha trước, rồi tạo con trong cùng giao dịch offline. Push từ bảng con áp dụng cả hai cùng version, và push tiếp từ bảng cha gửi 0 thao tác. Khi cha đã tồn tại lúc replica ghi offline nhưng bị xóa trên server trước push, server từ chối cả nhóm. `refused()` của bảng con ghi `fk_parent_missing`, và insert độc lập đi cùng nhóm cũng không xuất hiện trên server.
 
-Hai replica chạy qua Node/Wasm. Probe sync kiểm tra việc tiến trình Node bị kill trước khi tiến trình khác retry. Chưa thử mất điện hay replay sau khi hết thời hạn lưu kết quả. Integration test xUnit riêng vẫn bao phủ việc thoát và khởi động tiến trình mới cho offline CRUD.
+Probe checkpoint ngắt WebSocket khi frame delta chứa giá trị đánh dấu đến, trước khi chuyển frame vào Wasm. Replica mở lại giữ nguyên dữ liệu và token cũ. Lần sync tiếp dùng chính token đó, nhận đủ 1 upsert và 1 delete, không cần full fill. Mở lại lần nữa xác nhận cả token mới và dữ liệu mới. Ca này dùng delta một frame và chưa bao phủ gián đoạn sau khi đã áp dụng một phần của pull nhiều frame.
+
+Ca live stream nhận một frame cập nhật, kiểm tra token đã tiến, rồi chặn frame chứa thay đổi kế tiếp. Sau reopen, replica giữ hàng và token của frame đã áp dụng. Pull một lần nhận đúng thay đổi còn thiếu. Đây là hai frame trên một live subscription; chưa thử gián đoạn giữa nhiều frame của một pull one-shot.
+
+Ca lọc dùng replica riêng với điều kiện `payload = 'in_scope'`. Server đổi một hàng vào và một hàng ra khỏi phạm vi. Delta tiếp tục từ token cũ, báo 1 upsert và 1 delete. Replica mở lại chỉ chứa hàng vừa vào phạm vi.
+
+Các replica chạy qua Node/Wasm. Probe sync kiểm tra việc tiến trình Node bị kill trước khi tiến trình khác retry. Chưa thử mất điện hay replay sau khi hết thời hạn lưu kết quả. Integration test xUnit riêng vẫn bao phủ việc thoát và khởi động tiến trình mới cho offline CRUD.
+
+
+## Chạy toàn bộ Phase 0 một lần
+
+Từ thư mục repo, khởi động server Windows chính ở cổng 4820 và giải nén gói Wasm đã pin theo hướng dẫn trên. Sau đó chạy:
+
+```powershell
+.\tools\Sync.NET.Feasibility\run-phase0.ps1
+```
+
+Có thể truyền `-PackageDirectory` nếu gói nằm ngoài `.phase0/package`. Lệnh chạy build, console offline, xUnit, probe đồng bộ, probe pull nhiều trang và probe checkpoint hết hạn. Probe retention khởi động server riêng với data dir và log riêng trong `.phase0`, cổng mặc định 4821 và `--gc-retention 0commits`. Server riêng tự dừng sau lượt chạy. Chọn cổng khác với `-RetentionPort` nếu cần. [Cấu hình retention của KineDB](https://docs.kinedb.com/run#command-line-arguments)
+
+- **Pull nhiều trang:** đưa khoảng 9,4 MiB vào một bảng mới, chuyển trang dữ liệu đầu tiên vào Wasm và chặn trang thứ hai. Mở lại replica, kiểm tra toàn bộ 1.200 hàng sau khi pull lại và checkpoint cuối sau khi mở lại lần nữa. [Phân trang WATCH](https://docs.kinedb.com/sql#watch-live-queries)
+- **Checkpoint hết hạn:** lưu checkpoint cũ, tạo trạng thái server mới, rồi đợi truy vấn lịch sử xác nhận commit cũ đã vượt retention. Kiểm tra cache sau phục hồi có hàng hiện tại và đã bỏ hàng cũ. [Khoảng trống khi resume](https://docs.kinedb.com/sql#limits-and-the-gap-answer-allow-gap-and-max-resume-rows)
+- **Replay có trì hoãn:** thêm `-ReplayDelaySeconds <số-giây>` vào cùng lệnh để đo replay ở một mốc cụ thể sau khi server đã ghi và worker bị kill. Kết quả pass tại mốc đó chỉ cho biết replay còn hoạt động sau khoảng chờ đã chọn. Chưa có thiết lập đã xác minh để ép kết quả replay hết hạn. Retention của lịch sử pull được kiểm tra riêng.
+
+Hai probe mới và trình chạy gộp đang ở trạng thái **CHƯA CHẠY**. Kết quả PASS ở bảng trên thuộc các lượt kiểm chứng trước.
 
 ## Bước tiếp theo
 
 1. Lấy từ KineDB DLL Windows x64 và header C ABI có local, remote và sync exports, hoặc quyền truy cập source và quy trình build đúng commit. Xác nhận điều khoản tích hợp và phân phối. Chạy open/execute/close từ .NET bằng DLL rồi lặp lại probe ở ranh giới tiến trình và sau kill.
-2. Lặp lại probe sync với DLL native và thử kill tiến trình sau khi mất ACK. Đo thời hạn giữ kết quả replay và kiểm tra thứ tự push và việc từ chối nhóm giao dịch có ràng buộc khóa ngoại trước khi chốt hợp đồng SDK.
+2. Lặp lại probe sync với DLL native và thử kill tiến trình sau khi mất ACK. Chạy bộ Phase 0 gộp và ghi nhận kết quả của các probe mới trước khi chốt hợp đồng SDK.
