@@ -8,10 +8,19 @@ namespace SyncDotNet.KineDB;
 internal sealed class WorkerProcess : IAsyncDisposable
 {
     internal static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
+    private static readonly Lazy<string> Script = new(() =>
+    {
+        using var stream = typeof(WorkerProcess).Assembly.GetManifestResourceStream("SyncDotNet.KineDB.worker.mjs")
+            ?? throw new IOException("The KineDB worker resource is missing.");
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    });
     private readonly Process _process;
     private readonly Task _reader;
     private readonly Task _diagnostics;
     private readonly SemaphoreSlim _writer = new(1);
+    // A single stdin writer keeps JSON lines intact. Request IDs let responses
+    // complete independently when local reads overlap an asynchronous sync.
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
     private long _nextId;
     private int _closed;
@@ -27,6 +36,14 @@ internal sealed class WorkerProcess : IAsyncDisposable
         _process = Process.Start(start) ?? throw new IOException("Could not start the KineDB worker.");
         _diagnostics = _process.StandardError.BaseStream.CopyToAsync(Stream.Null);
         _reader = ReadResponsesAsync();
+    }
+
+    internal static void AddScriptArguments(ProcessStartInfo start)
+    {
+        start.ArgumentList.Add("--input-type=module");
+        start.ArgumentList.Add("--eval");
+        start.ArgumentList.Add(Script.Value);
+        start.ArgumentList.Add("--");
     }
 
     internal bool Closed => Volatile.Read(ref _closed) != 0;
@@ -74,6 +91,8 @@ internal sealed class WorkerProcess : IAsyncDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Terminate the worker before returning from an interrupted request.
+            // A later worker reopens the replica and uses KineDB's journal to recover.
             await AbortAsync();
             throw;
         }

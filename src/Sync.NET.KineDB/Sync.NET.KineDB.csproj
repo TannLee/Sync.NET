@@ -3,11 +3,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <IsPackable>false</IsPackable>
+    <Version>0.1.0-preview.1</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../Sync.NET/Sync.NET.csproj" />
-    <None Update="worker.mjs" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="Sync.NET.KineDB/worker.mjs" />
+    <EmbeddedResource Include="worker.mjs" LogicalName="SyncDotNet.KineDB.worker.mjs" />
   </ItemGroup>
 </Project>

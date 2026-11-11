@@ -10,6 +10,130 @@ namespace SyncDotNet.IntegrationTests;
 public sealed class Phase1Tests
 {
     [KineDbServerFact]
+    public async Task Revoking_table_access_blocks_push_without_discarding_offline_write()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+        var password = Guid.NewGuid().ToString("N");
+        await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
+        await server.SqlAsync($"CREATE USER 'offline' PASSWORD '{password}'", token);
+        await server.SqlAsync("GRANT SELECT, INSERT ON phase1_notes TO USER 'offline'", token);
+        var options = server.Options("revoked") with { User = "offline", GetPassword = _ => ValueTask.FromResult(password) };
+        var note = new Note("pending", "offline");
+        await using (var replica = new KineDbCollection<Note>(mapping, options))
+        {
+            var initial = await replica.SynchronizeAsync(cancellationToken: token);
+            Assert.True(initial.Status == SyncStatus.UpToDate, initial.ToString());
+            await replica.PutAsync(note, token);
+            await server.SqlAsync("REVOKE SELECT, INSERT ON phase1_notes FROM USER 'offline'", token);
+            var denied = await replica.SynchronizeAsync(cancellationToken: token);
+            Assert.Equal(SyncStatus.Failed, denied.Status);
+            Assert.Null(denied.Push);
+            Assert.Equal(0, (await server.SqlAsync("SELECT id FROM phase1_notes", token)).GetProperty("count").GetInt32());
+        }
+
+        await server.SqlAsync("GRANT SELECT, INSERT ON phase1_notes TO USER 'offline'", token);
+        await using var reopened = new KineDbCollection<Note>(mapping, options);
+        Assert.Equal(note, await reopened.GetAsync("pending", token));
+        var pushed = await reopened.SynchronizeAsync(cancellationToken: token);
+        Assert.True(pushed.Status == SyncStatus.UpToDate, pushed.ToString());
+        Assert.Equal(1, pushed.Push!.Sent);
+    }
+
+    [KineDbServerFact]
+    public async Task Attachment_stream_survives_reopen_and_converges()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        const string table = "phase4_files";
+        await server.SqlAsync(KineDbAttachments.CreateTableSql(table), token);
+        var bytes = new byte[350_000];
+        new Random(42).NextBytes(bytes);
+        var writerOptions = server.Options("file-a");
+        await using var reader = new KineDbAttachments(table, server.Options("file-b"));
+        await using (var writer = new KineDbAttachments(table, writerOptions))
+        {
+            var initial = await writer.SynchronizeAsync(cancellationToken: token);
+            Assert.True(initial.Status == SyncStatus.UpToDate, initial.ToString());
+            Assert.Equal(SyncStatus.UpToDate, (await reader.SynchronizeAsync(cancellationToken: token)).Status);
+            using var input = new MemoryStream(bytes);
+            var stored = await writer.PutAsync("sample.bin", input, token);
+            Assert.Equal(bytes.Length, stored.Bytes);
+            Assert.Equal(64, stored.Blake3.Length);
+        }
+        await using var reopened = new KineDbAttachments(table, writerOptions);
+        var push = await reopened.SynchronizeAsync(cancellationToken: token);
+        Assert.True(push.Status == SyncStatus.UpToDate, push.ToString());
+        Assert.Equal(1, push.Push!.Sent);
+        var pull = await reader.SynchronizeAsync(cancellationToken: token);
+        Assert.True(pull.Status == SyncStatus.UpToDate, pull.ToString());
+        using var output = new MemoryStream();
+        Assert.True(await reader.CopyToAsync("sample.bin", output, token));
+        Assert.Equal(bytes, output.ToArray());
+        Assert.True(await reopened.DeleteAsync("sample.bin", token));
+        Assert.Equal(SyncStatus.UpToDate, (await reopened.SynchronizeAsync(cancellationToken: token)).Status);
+        Assert.Equal(SyncStatus.UpToDate, (await reader.SynchronizeAsync(cancellationToken: token)).Status);
+        Assert.False(await reader.CopyToAsync("sample.bin", Stream.Null, token));
+    }
+
+    [KineDbServerFact]
+    public async Task Bootstrap_activates_only_a_validated_new_replica()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+        var options = server.Options("staged");
+        await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
+        await server.SqlAsync("""INSERT INTO phase1_notes (id,payload) VALUES ('key','{"Id":"key","Text":"ready"}')""", token);
+
+        var bootstrap = await KineDbCollection<Note>.BootstrapAsync(mapping, options, token);
+        Assert.True(bootstrap.Status == SyncStatus.UpToDate, bootstrap.ToString());
+        Assert.NotEmpty(bootstrap.Pull!.Checkpoint!);
+        Assert.NotEmpty(bootstrap.Pull.SnapshotCommit!);
+        await using var opened = new KineDbCollection<Note>(mapping, options);
+        Assert.Equal(new Note("key", "ready"), await opened.GetAsync("key", token));
+        await Assert.ThrowsAsync<IOException>(() => KineDbCollection<Note>.BootstrapAsync(mapping, options, token));
+    }
+
+    [KineDbServerFact]
+    public async Task Opt_in_push_retry_recovers_a_lost_acknowledgment()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        await using var proxy = new ReplyGate(server.Port);
+        var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+        await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
+        await using var replica = server.Open(mapping, "a", endpoint: proxy.Endpoint, pushRetryCount: 1);
+        Assert.Equal(SyncStatus.UpToDate, (await replica.SynchronizeAsync(cancellationToken: token)).Status);
+        await replica.PutAsync(new("key", "committed"), token);
+        var sync = replica.SynchronizeAsync(new InlineProgress(stage =>
+        {
+            if (stage == SyncStage.Pushing) proxy.HoldReplies();
+        }), token);
+        try
+        {
+            await WaitForRemoteNote(server, "committed", token);
+            await proxy.WaitForHeldReplyAsync(token);
+            Assert.False(sync.IsCompleted);
+            proxy.DisconnectReplies();
+        }
+        finally
+        {
+            proxy.ReleaseReplies();
+        }
+        var result = await sync;
+        Assert.True(result.Status == SyncStatus.UpToDate, result.ToString());
+        Assert.Equal(1, result.Push!.RetryAttempts);
+        Assert.True(Assert.Single(result.Push.Outcomes).Replayed);
+        Assert.Equal(0, (await replica.SynchronizeAsync(cancellationToken: token)).Push!.Sent);
+    }
+
+    [KineDbServerFact]
     public async Task Scoped_replica_pulls_and_writes_only_its_key()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -42,6 +166,21 @@ public sealed class Phase1Tests
         Assert.Equal(SyncStatus.UpToDate, (await full.SynchronizeAsync(cancellationToken: token)).Status);
         Assert.Equal(new Note("included", "after"), await full.GetAsync("included", token));
         Assert.Equal(new Note("excluded", "outside"), await full.GetAsync("excluded", token));
+        await reopened.PutAsync(new("included", "before refill"), token);
+        var recovered = await reopened.RecoverScopeAsync(cancellationToken: token);
+        Assert.True(recovered.Status == SyncStatus.UpToDate, recovered.ToString());
+        Assert.Equal(1, recovered.Push!.Sent);
+        Assert.True(recovered.Pull!.Full);
+        Assert.Equal(new Note("included", "before refill"), Assert.Single(await reopened.ListAsync(token)));
+
+        await using var overlapping = server.Open(mapping, "overlap", scopeKey: "included");
+        Assert.Equal(SyncStatus.UpToDate, (await overlapping.SynchronizeAsync(cancellationToken: token)).Status);
+        Assert.Single(await SyncScopeView.ReadUnionAsync(mapping, [reopened, overlapping], token));
+        await reopened.PutAsync(new("included", "different local edit"), token);
+        await Assert.ThrowsAsync<InvalidDataException>(() => SyncScopeView.ReadUnionAsync(mapping, [reopened, overlapping], token));
+        Assert.True(await reopened.DeleteAsync("included", token));
+        Assert.Equal(new Note("included", "before refill"),
+            Assert.Single(await SyncScopeView.ReadUnionAsync(mapping, [reopened, overlapping], token)));
     }
 
     [KineDbServerFact]
@@ -188,9 +327,11 @@ public sealed class Phase1Tests
         var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
         await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
 
-        await using var replica = server.Open(mapping, "a", endpoint: proxy.Endpoint);
+        await using var replica = new KineDbCollection<Note>(mapping, server.Options("a", endpoint: proxy.Endpoint)
+            with { MaxPendingLocalOperations = 1, MaxPayloadBytes = 64 });
         var initial = await replica.SynchronizeAsync(cancellationToken: token);
         Assert.True(initial.Status == SyncStatus.UpToDate, initial.ToString());
+        await Assert.ThrowsAsync<ArgumentException>(() => replica.PutAsync(new("key", new string('x', 64)), token));
         await replica.PutAsync(new("key", "first"), token);
         var push = replica.SynchronizeAsync(new InlineProgress(stage =>
         {
@@ -204,6 +345,7 @@ public sealed class Phase1Tests
             Assert.False(push.IsCompleted);
             queuedEdit = replica.PutAsync(new("key", "second"), token);
             Assert.False(queuedEdit.IsCompleted);
+            await Assert.ThrowsAsync<IOException>(() => replica.PutAsync(new("key", "queue full"), token));
             Assert.Equal(new Note("key", "first"), await replica.GetAsync("key", token));
         }
         finally
@@ -339,18 +481,23 @@ public sealed class Phase1Tests
 
         internal KineDbCollection<T> Open<T>(CollectionMapping<T> mapping, string name,
             Func<CancellationToken, ValueTask<string>>? password = null, Uri? endpoint = null,
-            string? scopeKey = null) where T : class =>
-            new(mapping, new KineDbReplicaOptions(Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!,
+            string? scopeKey = null, int pushRetryCount = 0) where T : class =>
+            new(mapping, Options(name, password, endpoint) with { ScopeKey = scopeKey, PushRetryCount = pushRetryCount });
+
+        internal KineDbReplicaOptions Options(string name,
+            Func<CancellationToken, ValueTask<string>>? password = null, Uri? endpoint = null) =>
+            new(Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!,
                 Path.Combine(_directory.FullName, name),
                 endpoint ?? new UriBuilder(_http.BaseAddress!) { Scheme = "ws", Path = "/ws" }.Uri,
-                "root", password ?? (_ => ValueTask.FromResult(_password))) { ScopeKey = scopeKey });
+                "root", password ?? (_ => ValueTask.FromResult(_password)));
 
         internal async Task<JsonElement> SqlAsync(string sql, CancellationToken token)
         {
             using var response = await _http.PostAsync("/sql", new StringContent(sql, Encoding.UTF8), token);
             response.EnsureSuccessStatusCode();
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
-            Assert.NotEqual("error", json.RootElement.GetProperty("type").GetString());
+            Assert.True(json.RootElement.GetProperty("type").GetString() != "error",
+                sql.StartsWith("CREATE USER", StringComparison.Ordinal) ? "User provisioning failed." : json.RootElement.ToString());
             return json.RootElement.Clone();
         }
 
@@ -377,6 +524,7 @@ public sealed class Phase1Tests
         private readonly int _upstreamPort;
         private readonly Task _accept;
         private TaskCompletionSource? _gate;
+        private TaskCompletionSource? _heldReply;
 
         internal ReplyGate(int upstreamPort)
         {
@@ -386,8 +534,14 @@ public sealed class Phase1Tests
         }
 
         internal Uri Endpoint => new($"ws://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/ws");
-        internal void HoldReplies() => Volatile.Write(ref _gate, new(TaskCreationOptions.RunContinuationsAsynchronously));
+        internal void HoldReplies()
+        {
+            Volatile.Write(ref _heldReply, new(TaskCreationOptions.RunContinuationsAsynchronously));
+            Volatile.Write(ref _gate, new(TaskCreationOptions.RunContinuationsAsynchronously));
+        }
+        internal Task WaitForHeldReplyAsync(CancellationToken token) => Volatile.Read(ref _heldReply)!.Task.WaitAsync(token);
         internal void ReleaseReplies() => Interlocked.Exchange(ref _gate, null)?.TrySetResult();
+        internal void DisconnectReplies() => Interlocked.Exchange(ref _gate, null)?.TrySetException(new IOException("Test dropped the reply."));
 
         private async Task AcceptAsync()
         {
@@ -430,7 +584,11 @@ public sealed class Phase1Tests
             int count;
             while ((count = await source.ReadAsync(buffer, token)) != 0)
             {
-                if (Volatile.Read(ref _gate) is { } gate) await gate.Task.WaitAsync(token);
+                if (Volatile.Read(ref _gate) is { } gate)
+                {
+                    Volatile.Read(ref _heldReply)?.TrySetResult();
+                    await gate.Task.WaitAsync(token);
+                }
                 await target.WriteAsync(buffer.AsMemory(0, count), token);
             }
         }

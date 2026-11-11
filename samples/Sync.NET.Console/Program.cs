@@ -84,8 +84,10 @@ static async Task RunBenchmarkAsync(KineDbReplicaOptions options, int count, Jso
     await ProvisionAsync(options.Endpoint, options.User, KineDbCollection<Note>.CreateTableSql(table), token);
     try
     {
-        await using var writer = new KineDbCollection<Note>(mapping, options with { ReplicaDirectory = Path.Combine(directory, "writer") });
-        await using var reader = new KineDbCollection<Note>(mapping, options with { ReplicaDirectory = Path.Combine(directory, "reader") });
+        var writerDirectory = Path.Combine(directory, "writer");
+        var readerDirectory = Path.Combine(directory, "reader");
+        await using var writer = new KineDbCollection<Note>(mapping, options with { ReplicaDirectory = writerDirectory });
+        await using var reader = new KineDbCollection<Note>(mapping, options with { ReplicaDirectory = readerDirectory });
         await SyncOrThrowAsync(writer, token);
         await SyncOrThrowAsync(reader, token);
 
@@ -109,6 +111,47 @@ static async Task RunBenchmarkAsync(KineDbReplicaOptions options, int count, Jso
             !expected.SequenceEqual(await reader.ListAsync(token)))
             throw new IOException("Benchmark replicas did not converge.");
 
+        var changed = count / 4;
+        var replacements = expected.Take(changed).Select(note => note with { Text = new string('y', 256) }).ToArray();
+        var additions = Enumerable.Range(count, changed).Select(i => new Note($"row-{i:D6}", new string('z', 256))).ToArray();
+        clock.Restart();
+        foreach (var note in replacements)
+            await writer.PutAsync(note, token);
+        foreach (var note in expected.Skip(changed).Take(changed))
+            if (!await writer.DeleteAsync(note.Id, token))
+                throw new IOException("Benchmark did not find a row scheduled for deletion.");
+        foreach (var note in additions)
+            await writer.PutAsync(note, token);
+        var mixedWriteTime = clock.Elapsed;
+
+        clock.Restart();
+        var mixedPush = await SyncOrThrowAsync(writer, token);
+        var mixedWriterTime = clock.Elapsed;
+        clock.Restart();
+        var mixedPull = await SyncOrThrowAsync(reader, token);
+        var mixedReaderTime = clock.Elapsed;
+        var final = replacements.Concat(expected.Skip(changed * 2)).Concat(additions);
+        if (mixedPush.Push?.Sent != changed * 3 || mixedPull.Pull?.Upserts != changed * 2 ||
+            mixedPull.Pull?.Removes != changed || !final.SequenceEqual(await reader.ListAsync(token)))
+            throw new IOException("Benchmark replicas did not converge after mixed changes.");
+
+        var contested = final.Take(Math.Max(1, changed)).ToArray();
+        foreach (var note in contested)
+        {
+            await writer.PutAsync(note with { Text = "winning edit" }, token);
+            await reader.PutAsync(note with { Text = "stale edit" }, token);
+        }
+        await SyncOrThrowAsync(writer, token);
+        clock.Restart();
+        var conflicts = await reader.SynchronizeAsync(cancellationToken: token);
+        var conflictSyncTime = clock.Elapsed;
+        if (conflicts.Status != SyncStatus.Partial || conflicts.Push?.Outcomes.Count != contested.Length ||
+            conflicts.Push.Outcomes.Any(outcome => outcome.Status != WriteStatus.Conflict) ||
+            (await reader.ListRefusedAsync(token)).Count != contested.Length)
+            throw new IOException("Benchmark did not receive the expected conflict outcomes.");
+
+        await writer.DisposeAsync();
+        await reader.DisposeAsync();
         Array.Sort(latencies);
         Console.WriteLine(JsonSerializer.Serialize(new
         {
@@ -117,6 +160,15 @@ static async Task RunBenchmarkAsync(KineDbReplicaOptions options, int count, Jso
             OfflineWriteP95Milliseconds = latencies[(int)Math.Ceiling(count * 0.95) - 1],
             WriterSyncMilliseconds = writerSyncTime.TotalMilliseconds,
             ReaderSyncMilliseconds = readerSyncTime.TotalMilliseconds,
+            MixedChanges = changed * 3,
+            MixedOfflineWriteMilliseconds = mixedWriteTime.TotalMilliseconds,
+            MixedWriterSyncMilliseconds = mixedWriterTime.TotalMilliseconds,
+            MixedReaderSyncMilliseconds = mixedReaderTime.TotalMilliseconds,
+            Conflicts = contested.Length,
+            ConflictSyncMilliseconds = conflictSyncTime.TotalMilliseconds,
+            DotNetPeakWorkingSetBytes = Process.GetCurrentProcess().PeakWorkingSet64,
+            WriterReplicaBytes = ReplicaBytes(writerDirectory),
+            ReaderReplicaBytes = ReplicaBytes(readerDirectory),
             ReplicaDirectory = directory
         }, json));
     }
@@ -126,6 +178,9 @@ static async Task RunBenchmarkAsync(KineDbReplicaOptions options, int count, Jso
         await ProvisionAsync(options.Endpoint, options.User, $"DROP TABLE IF EXISTS {table}", cleanup.Token);
     }
 }
+
+static long ReplicaBytes(string directory) =>
+    new DirectoryInfo(directory).EnumerateFiles("*", SearchOption.AllDirectories).Sum(file => file.Length);
 
 static async Task<SyncResult> SyncOrThrowAsync(ISyncCollection<Note> replica, CancellationToken token)
 {

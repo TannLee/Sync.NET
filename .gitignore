@@ -2,3 +2,4 @@
 **/obj/
 **/node_modules/
 /.phase0/
+/.vs/
