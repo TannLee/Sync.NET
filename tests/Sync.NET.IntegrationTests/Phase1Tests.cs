@@ -10,6 +10,74 @@ namespace SyncDotNet.IntegrationTests;
 public sealed class Phase1Tests
 {
     [KineDbServerFact]
+    public async Task Incompatible_schema_stops_push_and_keeps_offline_row()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+        await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
+        await using var replica = server.Open(mapping, "a");
+        var initial = await replica.SynchronizeAsync(cancellationToken: token);
+        Assert.True(initial.Status == SyncStatus.UpToDate, initial.ToString());
+        var pending = new Note("pending", "offline");
+        await replica.PutAsync(pending, token);
+
+        await server.SqlAsync("ALTER TABLE phase1_notes ADD COLUMN extra TEXT", token);
+        var result = await replica.SynchronizeAsync(cancellationToken: token);
+        Assert.Equal(SyncStatus.Failed, result.Status);
+        Assert.Equal(SyncFailureKind.Configuration, result.FailureKind);
+        Assert.Equal(SyncStage.CheckingServer, result.Stage);
+        Assert.Null(result.Push);
+        Assert.Equal(pending, await replica.GetAsync("pending", token));
+        Assert.Equal(0, (await server.SqlAsync("SELECT id FROM phase1_notes", token)).GetProperty("count").GetInt32());
+    }
+
+    [KineDbPackageFact]
+    public async Task Health_check_retries_transient_responses_then_stops_on_revision_mismatch()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var token = timeout.Token;
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var directory = Directory.CreateTempSubdirectory("syncnet-health-");
+        try
+        {
+            var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+            await using var replica = new KineDbCollection<Note>(mapping, new(
+                Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!, directory.FullName,
+                new Uri($"ws://127.0.0.1:{port}/ws"), "root",
+                _ => throw new InvalidOperationException("An unsuccessful health check must not request credentials.")));
+
+            var sync = replica.SynchronizeAsync(cancellationToken: token);
+            await ReplyToHealthAsync(listener, "503 Service Unavailable", "{}", token);
+            await ReplyToHealthAsync(listener, "503 Service Unavailable", "{}", token);
+            await ReplyToHealthAsync(listener, "200 OK", """{"revision":"other"}""", token);
+            var result = await sync;
+            Assert.Equal(SyncStatus.Failed, result.Status);
+            Assert.Equal(SyncFailureKind.Configuration, result.FailureKind);
+            Assert.Equal(SyncStage.CheckingServer, result.Stage);
+            Assert.False(result.PushOutcomeUnknown);
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    private static async Task ReplyToHealthAsync(TcpListener listener, string status, string body, CancellationToken token)
+    {
+        using var client = await listener.AcceptTcpClientAsync(token);
+        using var stream = client.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        Assert.Equal("GET /health HTTP/1.1", await reader.ReadLineAsync(token));
+        while (await reader.ReadLineAsync(token) is { Length: > 0 }) { }
+        var response = $"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}";
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(response), token);
+    }
+
+    [KineDbServerFact]
     public async Task Two_replicas_converge_after_offline_edits_and_reopen()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
@@ -68,6 +136,11 @@ public sealed class Phase1Tests
         Assert.Equal(SyncStatus.Partial, conflict.Status);
         Assert.Equal(WriteStatus.Conflict, Assert.Single(conflict.Push!.Outcomes).Status);
         Assert.False(conflict.PushOutcomeUnknown);
+        await b.DisposeAsync();
+        await using var reopenedB = server.Open(mapping, "b");
+        var refusal = Assert.Single(await reopenedB.ListRefusedAsync(token));
+        Assert.Equal("conflict", refusal.Code);
+        Assert.Equal(conflict.Push.Outcomes[0].Sequence, refusal.Sequence);
     }
 
     [KineDbServerFact]

@@ -178,3 +178,13 @@ dotnet test Sync.NET.slnx
 ```
 
 Các test Phase 1 tự mở server Windows tạm trên loopback. Test chạy bootstrap, insert/update/delete offline, mở lại replica, đối chiếu hai replica, kết quả conflict, lệnh ghi chờ ACK và replay sau khi hủy push giữa chừng. Hai biến môi trường phải trỏ đến asset cùng bản dựng đã pin. Thay đường dẫn `.phase0/package` nếu đã giải nén gói ở chỗ khác.
+
+## Phase 2 · Phân loại lỗi và đọc thao tác bị từ chối
+
+`SyncResult.FailureKind` phân biệt lỗi cấu hình, lỗi tạm thời, lỗi provider, phản hồi không dùng được và push chưa rõ kết quả. `PushOutcomeUnknown` tiếp tục báo rủi ro khi hủy push. API chưa tự retry.
+
+`IRefusedWriteReader.ListRefusedAsync()` đọc các mục KineDB lưu sau conflict hoặc từ chối, kể cả sau khi mở lại replica. Phương thức cần thông tin kết nối để mở session và trả mã lý do, khóa, số thứ tự và phiên bản KineDB cung cấp.
+
+Bước kiểm tra server thử tối đa 3 lần khi gặp lỗi tạm thời, với thời gian chờ tăng dần và có độ lệch ngẫu nhiên. Lỗi sai phiên bản dừng ngay. Retry này diễn ra trước push và có thể hủy trong lúc chờ.
+
+Trước mỗi lần đồng bộ, provider đọc schema bảng từ server. Bảng phải có đúng hai cột: khóa chính `id TEXT` và `payload TEXT NOT NULL`. Schema không tương thích trả lỗi cấu hình trước khi push, giữ bản ghi offline trong replica. Ca kiểm thử thêm cột trên server sau khi replica đã ghi offline và xác nhận server chưa nhận bản ghi đó.

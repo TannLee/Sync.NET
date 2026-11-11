@@ -25,6 +25,15 @@ public interface ISyncCollection<T> : IAsyncDisposable where T : class
 public enum SyncStage { CheckingServer, Pushing, Pulling, Completed }
 public enum SyncStatus { UpToDate, Partial, Deferred, Cancelled, Failed }
 public enum WriteStatus { Applied, Conflict, Rejected, Merged, Unknown }
+public enum SyncFailureKind { Configuration, Transient, Provider, UnknownPushOutcome, InvalidResponse }
+
+public interface IRefusedWriteReader
+{
+    Task<IReadOnlyList<RefusedWrite>> ListRefusedAsync(CancellationToken cancellationToken = default);
+}
+
+public sealed record RefusedWrite(string? Sequence, string? Operation, JsonElement Key,
+    string? Code, string? Reason, string? ReadVersion, string? ServerVersion);
 
 public sealed record WriteOutcome(
     WriteStatus Status, string? Sequence, bool Replayed,
@@ -36,4 +45,7 @@ public sealed record PullResult(
 
 public sealed record SyncResult(
     SyncStatus Status, SyncStage Stage, PushResult? Push = null, PullResult? Pull = null,
-    bool PushOutcomeUnknown = false, string? Error = null);
+    bool PushOutcomeUnknown = false, string? Error = null)
+{
+    public SyncFailureKind? FailureKind { get; init; }
+}

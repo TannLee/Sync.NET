@@ -93,7 +93,8 @@ internal sealed class WorkerProcess : IAsyncDisposable
                     var failure = new KineDbOperationException(
                         error.GetString() ?? "KineDB operation failed.",
                         response.GetProperty("retryable").GetBoolean(),
-                        response.GetProperty("outcomeUnknown").GetBoolean());
+                        response.GetProperty("outcomeUnknown").GetBoolean(),
+                        response.GetProperty("configuration").GetBoolean());
                     if (_pending.TryRemove(id, out var pending))
                         pending.TrySetException(failure);
                 }
@@ -167,9 +168,10 @@ internal sealed class WorkerProcess : IAsyncDisposable
     }
 }
 
-internal sealed class KineDbOperationException(string message, bool retryable, bool outcomeUnknown)
+internal sealed class KineDbOperationException(string message, bool retryable, bool outcomeUnknown, bool configuration)
     : IOException(message)
 {
     internal bool Retryable { get; } = retryable;
     internal bool OutcomeUnknown { get; } = outcomeUnknown;
+    internal bool Configuration { get; } = configuration;
 }

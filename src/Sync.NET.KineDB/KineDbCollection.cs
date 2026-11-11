@@ -11,7 +11,7 @@ public sealed record KineDbReplicaOptions(
     public string NodeExecutable { get; init; } = "node";
 }
 
-public sealed class KineDbCollection<T> : ISyncCollection<T> where T : class
+public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReader where T : class
 {
     private readonly CollectionMapping<T> _mapping;
     private readonly KineDbReplicaOptions _options;
@@ -96,9 +96,10 @@ public sealed class KineDbCollection<T> : ISyncCollection<T> where T : class
             await _mutation.WaitAsync(cancellationToken);
             entered = true;
             progress?.Report(stage);
-            var ready = (await SendAsync("check", cancellationToken, interruptible: true)).GetBoolean();
+            var ready = await CheckServerAsync(cancellationToken);
             var password = await _options.GetPassword(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
+            await SendAsync("schema", cancellationToken, password: password, interruptible: true);
             if (ready)
             {
                 stage = SyncStage.Pushing;
@@ -108,7 +109,8 @@ public sealed class KineDbCollection<T> : ISyncCollection<T> where T : class
                 if (!push.OutcomesComplete)
                 {
                     return new(SyncStatus.Partial, stage, push, PushOutcomeUnknown: true,
-                        Error: "KineDB did not return a usable outcome for every write.");
+                        Error: "KineDB did not return a usable outcome for every write.")
+                        { FailureKind = SyncFailureKind.UnknownPushOutcome };
                 }
             }
 
@@ -127,18 +129,57 @@ public sealed class KineDbCollection<T> : ISyncCollection<T> where T : class
         }
         catch (KineDbOperationException error)
         {
+            var unknown = stage == SyncStage.Pushing && (error.OutcomeUnknown || error.Retryable);
+            var kind = unknown ? SyncFailureKind.UnknownPushOutcome : error.Configuration ? SyncFailureKind.Configuration :
+                error.Retryable ? SyncFailureKind.Transient : SyncFailureKind.Provider;
             return new(push is not null ? SyncStatus.Partial : error.Retryable ? SyncStatus.Deferred : SyncStatus.Failed,
-                stage, push, pull, stage == SyncStage.Pushing && (error.OutcomeUnknown || error.Retryable), error.Message);
+                stage, push, pull, unknown, error.Message) { FailureKind = kind };
         }
         catch (Exception error) when (error is IOException or InvalidDataException or JsonException or System.ComponentModel.Win32Exception)
         {
+            var unknown = stage == SyncStage.Pushing && push is null;
             return new(push is not null ? SyncStatus.Partial : SyncStatus.Failed, stage, push, pull,
-                PushOutcomeUnknown: stage == SyncStage.Pushing && push is null,
-                Error: "The KineDB worker did not return a usable response.");
+                PushOutcomeUnknown: unknown, Error: "The KineDB worker did not return a usable response.")
+                { FailureKind = unknown ? SyncFailureKind.UnknownPushOutcome : SyncFailureKind.InvalidResponse };
         }
         finally
         {
             if (entered) _mutation.Release();
+        }
+    }
+
+    private async Task<bool> CheckServerAsync(CancellationToken cancellationToken)
+    {
+        const int maxAttempts = 3;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return (await SendAsync("check", cancellationToken, interruptible: true)).GetBoolean();
+            }
+            catch (KineDbOperationException error) when (error.Retryable && attempt < maxAttempts)
+            {
+                var delay = TimeSpan.FromMilliseconds(100 * (1 << (attempt - 1)) + Random.Shared.Next(50));
+                await Task.Delay(delay, cancellationToken);
+            }
+        }
+    }
+
+    public async Task<IReadOnlyList<RefusedWrite>> ListRefusedAsync(CancellationToken cancellationToken = default)
+    {
+        await _mutation.WaitAsync(cancellationToken);
+        try
+        {
+            var password = await _options.GetPassword(cancellationToken);
+            var rows = await SendAsync("refused", cancellationToken, password: password, interruptible: true);
+            return rows.EnumerateArray().Select(row => new RefusedWrite(
+                OptionalText(row, "seq"), OptionalText(row, "op"), row.GetProperty("pk"),
+                OptionalText(row, "code"), OptionalText(row, "reason"),
+                OptionalText(row, "readVersion"), OptionalText(row, "serverVersion"))).ToArray();
+        }
+        finally
+        {
+            _mutation.Release();
         }
     }
 

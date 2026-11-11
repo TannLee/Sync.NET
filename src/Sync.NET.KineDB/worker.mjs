@@ -41,6 +41,9 @@ async function execute({ command, key, payload, password }) {
             const health = new URL('/health', endpoint);
             health.protocol = health.protocol === 'wss:' ? 'https:' : 'http:';
             const response = await fetch(health, { signal: AbortSignal.timeout(10_000), redirect: 'error' });
+            if (response.status === 429 || response.status >= 500) {
+                throw Object.assign(new Error('The KineDB server is temporarily unavailable.'), { retryable: true });
+            }
             if (!response.ok || (await response.json()).revision !== revision) {
                 throw new Error('The server revision does not match the KineDB pin.');
             }
@@ -49,6 +52,22 @@ async function execute({ command, key, payload, password }) {
         case 'get':
             requireReady();
             return (await db.sql(`SELECT id, payload FROM ${table} WHERE id = $1`, [key])).data;
+        case 'schema': {
+            const connection = await db.connect(endpoint, { user, password });
+            try {
+                const description = await connection.describe(name);
+                const { columns, primary_key: keyColumns } = description;
+                const id = columns.find(column => column.name === 'id');
+                const data = columns.find(column => column.name === 'payload');
+                if (columns.length !== 2 || keyColumns.length !== 1 || keyColumns[0] !== 'id' ||
+                    id?.type.toLowerCase() !== 'text' || data?.type.toLowerCase() !== 'text' || !data.not_null) {
+                    throw new Error('The KineDB table must have a TEXT id primary key and a non-null TEXT payload.');
+                }
+                return null;
+            } finally {
+                await connection.close();
+            }
+        }
         case 'list':
             requireReady();
             return (await db.sql(`SELECT id, payload FROM ${table} ORDER BY id`)).data;
@@ -64,6 +83,9 @@ async function execute({ command, key, payload, password }) {
         case 'push':
             requireReady();
             return await db.push(name, session);
+        case 'refused':
+            requireReady();
+            return await db.refused(name, session);
         case 'pull': {
             const result = await db.sync(name, { ...session, live: false, pack: false });
             if (!ready && !result.gap) {
@@ -84,11 +106,12 @@ async function reply(request) {
         response = { id: request.id, value: await execute(request) };
     } catch (error) {
         // Avoid returning database errors that can contain credentials or row contents.
-        const configuration = error.message === 'The server revision does not match the KineDB pin.';
+        const configuration = error.message === 'The server revision does not match the KineDB pin.' ||
+            error.message === 'The KineDB table must have a TEXT id primary key and a non-null TEXT payload.';
         const notReady = error.message === 'Synchronize once before reading or editing a new replica.';
         response = { id: request.id, error: configuration || notReady ? error.message : 'KineDB operation failed.',
             retryable: error.retryable === true || error.name === 'TimeoutError' || error.cause?.code === 'ECONNREFUSED',
-            outcomeUnknown: error.outcomeUnknown === true };
+            outcomeUnknown: error.outcomeUnknown === true, configuration };
     }
     await new Promise((resolve, reject) => {
         process.stdout.write(JSON.stringify(response) + '\n', error => error ? reject(error) : resolve());
