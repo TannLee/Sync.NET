@@ -188,3 +188,9 @@ Các test Phase 1 tự mở server Windows tạm trên loopback. Test chạy boo
 Bước kiểm tra server thử tối đa 3 lần khi gặp lỗi tạm thời, với thời gian chờ tăng dần và có độ lệch ngẫu nhiên. Lỗi sai phiên bản dừng ngay. Retry này diễn ra trước push và có thể hủy trong lúc chờ.
 
 Trước mỗi lần đồng bộ, provider đọc schema bảng từ server. Bảng phải có đúng hai cột: khóa chính `id TEXT` và `payload TEXT NOT NULL`. Schema không tương thích trả lỗi cấu hình trước khi push, giữ bản ghi offline trong replica. Ca kiểm thử thêm cột trên server sau khi replica đã ghi offline và xác nhận server chưa nhận bản ghi đó.
+
+## Phase 3 · Replica theo phạm vi khóa
+
+Đặt `KineDbReplicaOptions.ScopeKey` để đồng bộ một khóa qua bộ lọc `id` của KineDB. Khóa phạm vi dùng 1–128 chữ cái ASCII, chữ số, dấu gạch dưới hoặc gạch ngang. API đọc chỉ trả hàng trong phạm vi, và lệnh ghi hay xóa khóa ngoài phạm vi báo lỗi. Mỗi phạm vi dùng thư mục replica riêng vì khóa phạm vi là một phần của danh tính replica. Replica toàn bảng tiếp tục dùng cấu hình hiện có.
+
+Ca tích hợp xác nhận initial pull chỉ nhận một hàng, lệnh ngoài phạm vi bị từ chối và bản sửa trong phạm vi vẫn push được sau khi mở lại. Quyền truy cập dữ liệu do KineDB server quyết định. Phần điều phối giữa các bảng và hợp nhất phạm vi chồng lấp chưa được triển khai.

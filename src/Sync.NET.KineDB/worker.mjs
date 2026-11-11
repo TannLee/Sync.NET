@@ -4,7 +4,11 @@ import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [packageDirectory, directory, name, schemaId, endpoint, user] = process.argv.slice(2);
+const [packageDirectory, directory, name, schemaId, endpoint, user, scopeKey] = process.argv.slice(2);
+if (scopeKey !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(scopeKey)) {
+    throw new Error('Invalid replica scope key.');
+}
+const predicate = scopeKey === undefined ? undefined : `id = '${scopeKey}'`;
 const revision = '3c2ace4d54857df44bf160fb71ddb2cb484d1009';
 const table = /^[a-z][a-z0-9_]{0,62}$/.test(name) && !name.startsWith('syncnet_') && !name.startsWith('kinedb_')
     ? '"' + name + '"' : null;
@@ -18,7 +22,9 @@ if (manifest.name !== '@kinedb/embedded' || manifest.version !== '0.0.0-g3c2ace4
 
 const { KineDB } = await import(pathToFileURL(join(packageDirectory, 'src', 'index.js')));
 const db = new KineDB('replica', { dir: directory, wasm, durability: 'commit', reconnect: false });
-const identity = JSON.stringify([name, schemaId, endpoint, user]);
+const identityParts = [name, schemaId, endpoint, user];
+if (scopeKey !== undefined) identityParts.push(scopeKey);
+const identity = JSON.stringify(identityParts);
 const metadata = 'syncnet_replica';
 await db.sql(`CREATE TABLE IF NOT EXISTS ${metadata} (id INT PRIMARY KEY, identity TEXT, ready INT)`);
 const binding = (await db.sql(`SELECT identity, ready FROM ${metadata} WHERE id = 1`)).data[0];
@@ -51,6 +57,7 @@ async function execute({ command, key, payload, password }) {
         }
         case 'get':
             requireReady();
+            if (scopeKey !== undefined && key !== scopeKey) return [];
             return (await db.sql(`SELECT id, payload FROM ${table} WHERE id = $1`, [key])).data;
         case 'schema': {
             const connection = await db.connect(endpoint, { user, password });
@@ -70,6 +77,8 @@ async function execute({ command, key, payload, password }) {
         }
         case 'list':
             requireReady();
+            if (scopeKey !== undefined)
+                return (await db.sql(`SELECT id, payload FROM ${table} WHERE id = $1`, [scopeKey])).data;
             return (await db.sql(`SELECT id, payload FROM ${table} ORDER BY id`)).data;
         case 'put':
             requireReady();
@@ -87,7 +96,7 @@ async function execute({ command, key, payload, password }) {
             requireReady();
             return await db.refused(name, session);
         case 'pull': {
-            const result = await db.sync(name, { ...session, live: false, pack: false });
+            const result = await db.sync(name, { ...session, predicate, live: false, pack: false });
             if (!ready && !result.gap) {
                 await db.sql(`SELECT id, payload FROM ${table} LIMIT 1`);
                 await db.sql(`UPDATE ${metadata} SET ready = 1 WHERE id = 1`);

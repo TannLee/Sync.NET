@@ -9,6 +9,7 @@ public sealed record KineDbReplicaOptions(
     Func<CancellationToken, ValueTask<string>> GetPassword)
 {
     public string NodeExecutable { get; init; } = "node";
+    public string? ScopeKey { get; init; }
 }
 
 public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReader where T : class
@@ -34,6 +35,8 @@ public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReade
         ArgumentException.ThrowIfNullOrWhiteSpace(options.User);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.NodeExecutable);
         ArgumentNullException.ThrowIfNull(options.GetPassword);
+        if (options.ScopeKey is { } scope && !Regex.IsMatch(scope, @"\A[A-Za-z0-9_-]{1,128}\z"))
+            throw new ArgumentException("ScopeKey must contain 1–128 ASCII letters, digits, underscores or hyphens.", nameof(options));
         ArgumentNullException.ThrowIfNull(options.Endpoint);
         var endpoint = options.Endpoint;
         if (!endpoint.IsAbsoluteUri || (endpoint.Scheme != "wss" && !(endpoint.Scheme == "ws" && endpoint.IsLoopback)) ||
@@ -74,6 +77,7 @@ public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReade
         cancellationToken.ThrowIfCancellationRequested();
         var key = _mapping.KeySelector(value);
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        RequireWritableKey(key);
         var payload = JsonSerializer.Serialize(value, _mapping.JsonOptions);
         await MutateAsync("put", key, payload, cancellationToken);
     }
@@ -81,7 +85,14 @@ public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReade
     public async Task<bool> DeleteAsync(string key, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        RequireWritableKey(key);
         return (await MutateAsync("delete", key, null, cancellationToken)).GetBoolean();
+    }
+
+    private void RequireWritableKey(string key)
+    {
+        if (_options.ScopeKey is { } scope && !string.Equals(key, scope, StringComparison.Ordinal))
+            throw new ArgumentException("The key is outside the replica scope.", nameof(key));
     }
 
     public async Task<SyncResult> SynchronizeAsync(
@@ -217,6 +228,8 @@ public sealed class KineDbCollection<T> : ISyncCollection<T>, IRefusedWriteReade
                 {
                     start.ArgumentList.Add(argument);
                 }
+                if (_options.ScopeKey is { } scope)
+                    start.ArgumentList.Add(scope);
                 _worker = new WorkerProcess(start);
             }
             worker = _worker;

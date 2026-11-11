@@ -10,6 +10,41 @@ namespace SyncDotNet.IntegrationTests;
 public sealed class Phase1Tests
 {
     [KineDbServerFact]
+    public async Task Scoped_replica_pulls_and_writes_only_its_key()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var mapping = new CollectionMapping<Note>("phase1_notes", "note-v1", note => note.Id);
+        await server.SqlAsync(KineDbCollection<Note>.CreateTableSql(mapping.Name), token);
+        await using var full = server.Open(mapping, "full");
+        Assert.Equal(SyncStatus.UpToDate, (await full.SynchronizeAsync(cancellationToken: token)).Status);
+        await full.PutAsync(new("included", "before"), token);
+        await full.PutAsync(new("excluded", "outside"), token);
+        Assert.Equal(2, (await full.SynchronizeAsync(cancellationToken: token)).Push!.Sent);
+
+        await using (var scoped = server.Open(mapping, "scope", scopeKey: "included"))
+        {
+            var initial = await scoped.SynchronizeAsync(cancellationToken: token);
+            Assert.True(initial.Status == SyncStatus.UpToDate, initial.ToString());
+            Assert.Equal(1, initial.Pull!.Upserts);
+            Assert.Equal(new Note("included", "before"), Assert.Single(await scoped.ListAsync(token)));
+            Assert.Null(await scoped.GetAsync("excluded", token));
+            await Assert.ThrowsAsync<ArgumentException>(() => scoped.PutAsync(new("excluded", "blocked"), token));
+            await Assert.ThrowsAsync<ArgumentException>(() => scoped.DeleteAsync("excluded", token));
+            await scoped.PutAsync(new("included", "after"), token);
+        }
+
+        await using var reopened = server.Open(mapping, "scope", scopeKey: "included");
+        var pushed = await reopened.SynchronizeAsync(cancellationToken: token);
+        Assert.Equal(SyncStatus.UpToDate, pushed.Status);
+        Assert.Equal(1, pushed.Push!.Sent);
+        Assert.Equal(SyncStatus.UpToDate, (await full.SynchronizeAsync(cancellationToken: token)).Status);
+        Assert.Equal(new Note("included", "after"), await full.GetAsync("included", token));
+        Assert.Equal(new Note("excluded", "outside"), await full.GetAsync("excluded", token));
+    }
+
+    [KineDbServerFact]
     public async Task Incompatible_schema_stops_push_and_keeps_offline_row()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
@@ -303,11 +338,12 @@ public sealed class Phase1Tests
         }
 
         internal KineDbCollection<T> Open<T>(CollectionMapping<T> mapping, string name,
-            Func<CancellationToken, ValueTask<string>>? password = null, Uri? endpoint = null) where T : class =>
-            new(mapping, new(Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!,
+            Func<CancellationToken, ValueTask<string>>? password = null, Uri? endpoint = null,
+            string? scopeKey = null) where T : class =>
+            new(mapping, new KineDbReplicaOptions(Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!,
                 Path.Combine(_directory.FullName, name),
                 endpoint ?? new UriBuilder(_http.BaseAddress!) { Scheme = "ws", Path = "/ws" }.Uri,
-                "root", password ?? (_ => ValueTask.FromResult(_password))));
+                "root", password ?? (_ => ValueTask.FromResult(_password))) { ScopeKey = scopeKey });
 
         internal async Task<JsonElement> SqlAsync(string sql, CancellationToken token)
         {
