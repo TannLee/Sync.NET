@@ -194,3 +194,15 @@ Trước mỗi lần đồng bộ, provider đọc schema bảng từ server. B�
 Đặt `KineDbReplicaOptions.ScopeKey` để đồng bộ một khóa qua bộ lọc `id` của KineDB. Khóa phạm vi dùng 1–128 chữ cái ASCII, chữ số, dấu gạch dưới hoặc gạch ngang. API đọc chỉ trả hàng trong phạm vi, và lệnh ghi hay xóa khóa ngoài phạm vi báo lỗi. Mỗi phạm vi dùng thư mục replica riêng vì khóa phạm vi là một phần của danh tính replica. Replica toàn bảng tiếp tục dùng cấu hình hiện có.
 
 Ca tích hợp xác nhận initial pull chỉ nhận một hàng, lệnh ngoài phạm vi bị từ chối và bản sửa trong phạm vi vẫn push được sau khi mở lại. Quyền truy cập dữ liệu do KineDB server quyết định. Phần điều phối giữa các bảng và hợp nhất phạm vi chồng lấp chưa được triển khai.
+
+## Phase 4 · Benchmark một bảng
+
+Khi server đã chạy và `$package` trỏ đến gói Wasm đã pin, chạy từ thư mục repo.
+
+```powershell
+dotnet run --project samples/Sync.NET.Console -- $package .phase0/benchmark benchmark 100
+```
+
+Benchmark dùng bảng riêng, hai replica mới và 1–5.000 bản ghi tổng hợp với 256 ký tự nội dung mỗi hàng. Nó đo tổng thời gian ghi offline, P95 của từng lệnh ghi, thời gian sync bên ghi và thời gian sync bên đọc. Hai thời gian sync bao gồm các bước kiểm tra kết nối và schema. Benchmark xác nhận hai replica hội tụ qua số thao tác push, số hàng pull và nội dung đọc được. Bảng thử nghiệm được xóa sau khi chạy. Thư mục replica được giữ để kiểm tra.
+
+Lượt chạy 100 hàng trên Windows x64 ghi offline trong khoảng 550 ms, P95 mỗi lần ghi 5,83 ms, sync bên ghi 183 ms và sync bên đọc 125 ms. Đây là một lượt đo trên server loopback.
