@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\tools\Sync.NET.Feasibility\Sync.NET.Feasibility.csproj" />
+    <ProjectReference Include="..\..\src\Sync.NET.KineDB\Sync.NET.KineDB.csproj" />
   </ItemGroup>
 
 </Project>

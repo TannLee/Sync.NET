@@ -1,5 +1,9 @@
 <Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Sync.NET.Console/Sync.NET.Console.csproj" />
+  </Folder>
   <Folder Name="/src/">
+    <Project Path="src/Sync.NET.KineDB/Sync.NET.KineDB.csproj" />
     <Project Path="src/Sync.NET/Sync.NET.csproj" />
   </Folder>
   <Folder Name="/tests/">

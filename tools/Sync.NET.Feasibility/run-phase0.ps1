@@ -42,6 +42,8 @@ try {
     Invoke-PhaseCommand 'Replica sync, transactions and replay' node @($probe, $PackageDirectory)
     Invoke-PhaseCommand 'Paged one-shot pull' node @($probe, $PackageDirectory, 'paged')
 
+    & (Join-Path $PSScriptRoot 'test-server-restart.ps1') -PackageDirectory $PackageDirectory -Port $RetentionPort
+
     $runName = 'retention-' + [Guid]::NewGuid().ToString('N')
     $env:KINEDB_ROOT_PASSWORD = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
     $env:SYNCNET_KINEDB_PORT = "$RetentionPort"

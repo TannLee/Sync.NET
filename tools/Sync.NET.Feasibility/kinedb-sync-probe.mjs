@@ -62,7 +62,7 @@ globalThis.WebSocket = class FaultInjectingWebSocket extends WebSocket {
 
 const { KineDB } = await import(pathToFileURL(join(packageDir, 'src/index.js')));
 const [mode, childDirectory, childTable] = process.argv.slice(3);
-assert.ok(!mode || mode === 'retention' || mode === 'paged' || (mode === 'lose-ack' && childDirectory && /^phase0_[a-f0-9]{16}$/.test(childTable)),
+assert.ok(!mode || mode === 'retention' || mode === 'paged' || (['lose-ack', 'restart-prepare', 'restart-verify'].includes(mode) && childDirectory && /^phase0_[a-f0-9]{16}$/.test(childTable)),
     'Invalid replay worker arguments.');
 const table = childTable ?? ('phase0_' + randomBytes(8).toString('hex'));
 const query = `SELECT id, payload FROM ${table} ORDER BY id`;
@@ -177,17 +177,7 @@ async function runProbe() {
             JSON.stringify(mixed.outcomes));
 
         await a.close();
-        const worker = fork(fileURLToPath(import.meta.url),
-            [packageDir, 'lose-ack', directory, table],
-            { timeout: 30_000, killSignal: 'SIGKILL' });
-        let killedAfterAckDrop = false;
-        worker.once('message', message => {
-            if (message === 'ack-dropped')
-                killedAfterAckDrop = worker.kill('SIGKILL');
-        });
-        const [exitCode, signal] = await once(worker, 'exit');
-        assert.ok(killedAfterAckDrop, `Worker exited before confirming the dropped ACK: ${exitCode}, ${signal}`);
-        assert.equal(signal, 'SIGKILL');
+        await killReplayWorker();
         const committed = [[1, 'winner'], [3, 'new'], [4, 'lost_ack'], [5, 'independent']];
         assert.deepEqual((await server(query)).data, committed);
         const beforeRetry = await b.sync(table, pull);
@@ -390,6 +380,55 @@ async function runProbe() {
     }
 }
 
+async function prepareServerRestart() {
+    const replica = open('a');
+    try {
+        await server(`CREATE TABLE ${table} (id INT PRIMARY KEY, payload TEXT)`);
+        await replica.sync(table, pull);
+    } finally {
+        await replica.close();
+    }
+    await killReplayWorker();
+    await localServerRestartRows();
+    console.log('PASS: server has committed the row and the client exited without receiving its ACK');
+}
+
+async function localServerRestartRows() {
+    assert.deepEqual((await server(query)).data, [[4, 'lost_ack']]);
+}
+
+async function verifyServerRestart() {
+    const replica = open('a');
+    try {
+        await localServerRestartRows();
+        const replay = await replica.push(table, session);
+        assert.equal(replay.sent, 1, JSON.stringify(replay));
+        assert.equal(replay.outcomes.length, 1);
+        assert.equal(replay.outcomes[0].status, 'applied');
+        assert.equal(replay.outcomes[0].replayed, true);
+        await localServerRestartRows();
+        assert.equal((await replica.push(table, session)).sent, 0);
+        console.log('PASS: replay survives server restart', JSON.stringify(replay.outcomes));
+    } finally {
+        await replica.close();
+        await server(`DROP TABLE IF EXISTS ${table}`);
+    }
+}
+
+async function killReplayWorker() {
+    const worker = fork(fileURLToPath(import.meta.url),
+        [packageDir, 'lose-ack', directory, table],
+        { timeout: 30_000, killSignal: 'SIGKILL' });
+    let killedAfterAckDrop = false;
+    worker.once('message', message => {
+        if (message === 'ack-dropped')
+            killedAfterAckDrop = worker.kill('SIGKILL');
+    });
+    const [exitCode, signal] = await once(worker, 'exit');
+    assert.ok(killedAfterAckDrop, `Worker exited before confirming the dropped ACK: ${exitCode}, ${signal}`);
+    assert.equal(signal, 'SIGKILL');
+}
+
 async function runPagedPull() {
     const replica = open('paged');
     let reopened;
@@ -480,9 +519,11 @@ async function runRetention() {
 
 try {
     if (mode === 'lose-ack') await loseAcknowledgment();
+    else if (mode === 'restart-prepare') await prepareServerRestart();
+    else if (mode === 'restart-verify') await verifyServerRestart();
     else if (mode === 'retention') await runRetention();
     else if (mode === 'paged') await runPagedPull();
     else await runProbe();
 } finally {
-    if (mode !== 'lose-ack') await rm(directory, { recursive: true, force: true });
+    if (!['lose-ack', 'restart-prepare'].includes(mode)) await rm(directory, { recursive: true, force: true });
 }
