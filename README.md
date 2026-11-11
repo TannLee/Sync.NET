@@ -22,17 +22,22 @@ Local writes wait for an active sync to finish. Tests on the pinned engine showe
 - KineDB server at commit `3c2ace4d54857df44bf160fb71ddb2cb484d1009`.
 - `@kinedb/embedded@0.0.0-g3c2ace4d5485`, extracted to a directory containing `package.json` and `src/kinedb.wasm`.
 
-The SDK checks the package version, Wasm checksum and server revision. The NuGet packages contain Sync.NET code and its worker. Obtain the KineDB server and Wasm package separately from the vendor. [KineDB downloads and server setup](https://docs.kinedb.com/run) · [Embedded SDK](https://docs.kinedb.com/clients/embedded.html)
+The SDK checks the package version, Wasm checksum and server revision. The repository contains the Sync.NET SDK and its worker. Obtain the KineDB server and Wasm package separately from the vendor. [KineDB downloads and server setup](https://docs.kinedb.com/run) · [Embedded SDK](https://docs.kinedb.com/clients/embedded.html)
 
-## Install from NuGet.org
-
-Once the preview is published, run this command in your .NET 10 project. NuGet resolves `Sync.NET` as a dependency of the KineDB provider.
+## Build from GitHub source
 
 ```powershell
-dotnet add package Sync.NET.KineDB --version 0.1.0-preview.1 --source https://api.nuget.org/v3/index.json
+git clone https://github.com/TannLee/Sync.NET.git
+Set-Location Sync.NET
+dotnet build Sync.NET.slnx -c Release
 ```
 
-**Publication status:** both preview packages have been built and tested. Upload to NuGet.org is pending. To try the implementation now, clone the repository and build the solution with `dotnet build Sync.NET.slnx`.
+The repository includes a console sample under `samples/Sync.NET.Console`. To use the SDK in a separate .NET 10 project, add a project reference to the cloned provider. The provider already references the core Sync.NET project.
+
+```powershell
+dotnet add path/to/MyApp.csproj reference path/to/Sync.NET/src/Sync.NET.KineDB/Sync.NET.KineDB.csproj
+```
+
 
 ## Set up KineDB on Windows
 
@@ -188,4 +193,4 @@ The benchmark creates a dedicated table and verifies convergence. A loopback run
 
 The tested deployment is Windows x64 with a Node/Wasm worker. Direct native integration in a .NET process, deployment on other platforms and installation on a separate clean machine remain unverified. Attachments have per-operation local limits, while an overall byte budget for a sync run remains open. The SDK preserves pending work when server access is revoked. Applications remain responsible for access to data already cached on a device.
 
-Check the terms for the KineDB runtime separately before redistribution. The provider's preview NuGet packages expect users to supply that runtime.
+Check the terms for the KineDB runtime separately before redistribution. Supply the KineDB runtime separately when running the provider.
