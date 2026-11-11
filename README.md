@@ -18,9 +18,9 @@ Kiểm chứng ngày 2026-11-10 trên Windows x64 với .NET SDK 10.0.402, runti
 | Checkpoint khi pull bị ngắt | PASS | Chặn frame dữ liệu, mở lại replica thấy dữ liệu và token cũ. Pull tiếp từ token cũ nhận 1 upsert và 1 delete. Dữ liệu mới và token mới còn sau reopen. |
 | Checkpoint sau khi nhận một phần live stream | PASS | Áp dụng frame đầu, chặn frame kế tiếp. Reopen giữ dữ liệu và token của frame đầu. Pull tiếp nhận đúng thay đổi còn thiếu. |
 | Delta có bộ lọc | PASS | Một hàng vào và một hàng rời bộ lọc. Delta báo 1 upsert, 1 delete và cache sau reopen chỉ còn hàng đúng phạm vi. |
-| Pull one-shot nhiều trang | CHƯA CHẠY | Đã thêm probe chặn trang dữ liệu thứ hai, mở lại và đối chiếu toàn bộ hàng. |
-| Checkpoint hết hạn | CHƯA CHẠY | Đã thêm probe với server retention riêng và xác nhận commit cũ hết hạn trước khi kiểm tra cache. |
-| Replay sau mất phản hồi | PASS | Chặn phản hồi WebSocket, kill tiến trình gửi push khi database còn mở, xác nhận server đã commit rồi mở replica trong tiến trình khác để retry. Outcome báo replayed và không phát sinh delta mới. |
+| Pull one-shot nhiều trang | PASS | Chặn trang thứ hai, mở lại rồi pull đủ 1.200 hàng và xác nhận checkpoint cuối. |
+| Checkpoint hết hạn | PASS | Server retention riêng từ chối truy vấn commit cũ. Replica phục hồi hàng hiện tại, bỏ hàng cũ và lưu checkpoint mới. |
+| Replay sau mất phản hồi | PASS | Chặn phản hồi WebSocket, kill tiến trình gửi push khi database còn mở, xác nhận server đã commit rồi mở replica trong tiến trình khác để retry. Outcome báo replayed và không phát sinh delta mới ở mốc retry mặc định và sau 60 giây. |
 
 Kết quả restart áp dụng cho đóng tiến trình có kiểm soát, với cấu hình Wasm `durability: 'commit'`. Chưa thử kill đột ngột, mất điện, lỗi đĩa hoặc khôi phục pending writes. `ILocalSql` là interface thử nghiệm cho một batch SQL, với mỗi lệnh commit riêng. Console và test dùng cùng kịch bản. Probe không có hợp đồng sync hoặc outbox riêng.
 
@@ -118,9 +118,9 @@ Có thể truyền `-PackageDirectory` nếu gói nằm ngoài `.phase0/package`
 - **Checkpoint hết hạn:** lưu checkpoint cũ, tạo trạng thái server mới, rồi đợi truy vấn lịch sử xác nhận commit cũ đã vượt retention. Kiểm tra cache sau phục hồi có hàng hiện tại và đã bỏ hàng cũ. [Khoảng trống khi resume](https://docs.kinedb.com/sql#limits-and-the-gap-answer-allow-gap-and-max-resume-rows)
 - **Replay có trì hoãn:** thêm `-ReplayDelaySeconds <số-giây>` vào cùng lệnh để đo replay ở một mốc cụ thể sau khi server đã ghi và worker bị kill. Kết quả pass tại mốc đó chỉ cho biết replay còn hoạt động sau khoảng chờ đã chọn. Chưa có thiết lập đã xác minh để ép kết quả replay hết hạn. Retention của lịch sử pull được kiểm tra riêng.
 
-Hai probe mới và trình chạy gộp đang ở trạng thái **CHƯA CHẠY**. Kết quả PASS ở bảng trên thuộc các lượt kiểm chứng trước.
+Trình chạy gộp đã hoàn tất với mã thoát 0 trên Windows x64. Lượt gộp dùng độ trễ replay mặc định 0 giây. Lượt probe đồng bộ riêng với `SYNCNET_KINEDB_REPLAY_DELAY_SECONDS=60` cũng pass. Retry báo `applied` và `replayed: true`, rồi pull nhận 0 upserts và 0 deletes. Kết quả chỉ xác nhận mốc 60 giây trên server đang chạy. Chưa đo giới hạn giữ replay hoặc thử server restart.
 
 ## Bước tiếp theo
 
 1. Lấy từ KineDB DLL Windows x64 và header C ABI có local, remote và sync exports, hoặc quyền truy cập source và quy trình build đúng commit. Xác nhận điều khoản tích hợp và phân phối. Chạy open/execute/close từ .NET bằng DLL rồi lặp lại probe ở ranh giới tiến trình và sau kill.
-2. Lặp lại probe sync với DLL native và thử kill tiến trình sau khi mất ACK. Chạy bộ Phase 0 gộp và ghi nhận kết quả của các probe mới trước khi chốt hợp đồng SDK.
+2. Lặp lại probe sync với DLL native và thử kill tiến trình sau khi mất ACK. Đo replay ở các mốc trì hoãn khi đã xác định yêu cầu giữ kết quả của SDK.
