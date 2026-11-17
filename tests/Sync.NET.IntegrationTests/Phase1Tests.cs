@@ -10,6 +10,65 @@ namespace SyncDotNet.IntegrationTests;
 public sealed class Phase1Tests
 {
     [KineDbServerFact]
+    public async Task Work_order_backlog_keeps_independent_edits_when_stale_edits_conflict()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var mapping = new CollectionMapping<WorkOrder>("work_orders", "work-order-v1", order => order.Id);
+        await server.SqlAsync(KineDbCollection<WorkOrder>.CreateTableSql(mapping.Name), token);
+        var orders = Enumerable.Range(1, 40).Select(i => new WorkOrder($"wo-{i:D2}", "Open", 0)).ToArray();
+        await using var dispatcher = server.Open(mapping, "dispatcher");
+        Assert.Equal(SyncStatus.UpToDate, (await dispatcher.SynchronizeAsync(cancellationToken: token)).Status);
+        foreach (var order in orders)
+            await dispatcher.PutAsync(order, token);
+        Assert.Equal(40, (await dispatcher.SynchronizeAsync(cancellationToken: token)).Push!.Sent);
+
+        var technicianOptions = server.Options("technician");
+        await using (var technician = new KineDbCollection<WorkOrder>(mapping, technicianOptions))
+            Assert.Equal(SyncStatus.UpToDate, (await technician.SynchronizeAsync(cancellationToken: token)).Status);
+
+        // Simulate three days of edits without advancing the server clock or waiting three days.
+        for (var day = 1; day <= 3; day++)
+        {
+            await using var offline = new KineDbCollection<WorkOrder>(mapping, technicianOptions with
+            {
+                GetPassword = _ => throw new InvalidOperationException("Offline edits must not request credentials.")
+            });
+            foreach (var order in orders)
+                await offline.PutAsync(order with { Status = "In progress", LastEditDay = day }, token);
+        }
+
+        foreach (var order in orders.Take(5))
+            await dispatcher.PutAsync(order with { Status = "Reassigned" }, token);
+        Assert.Equal(5, (await dispatcher.SynchronizeAsync(cancellationToken: token)).Push!.Sent);
+
+        await using (var technician = new KineDbCollection<WorkOrder>(mapping, technicianOptions))
+        {
+            Assert.All(await technician.ListAsync(token), order => Assert.Equal(3, order.LastEditDay));
+            var result = await technician.SynchronizeAsync(cancellationToken: token);
+            Assert.True(result.Status == SyncStatus.Partial, result.ToString());
+            Assert.True(result.Push!.OutcomesComplete);
+            Assert.Equal(35, result.Push.Outcomes.Count(outcome => outcome.Status == WriteStatus.Applied));
+            Assert.Equal(5, result.Push.Outcomes.Count(outcome => outcome.Status == WriteStatus.Conflict));
+        }
+
+        await using var reopened = new KineDbCollection<WorkOrder>(mapping, technicianOptions);
+        var refused = await reopened.ListRefusedAsync(token);
+        Assert.Equal(5, refused.Count);
+        Assert.All(refused, refusal => Assert.Equal("conflict", refusal.Code));
+        Assert.Equal(0, (await reopened.SynchronizeAsync(cancellationToken: token)).Push!.Sent);
+
+        Assert.Equal(SyncStatus.UpToDate, (await dispatcher.SynchronizeAsync(cancellationToken: token)).Status);
+        var expected = orders.Select((order, index) => index < 5
+            ? order with { Status = "Reassigned" }
+            : order with { Status = "In progress", LastEditDay = 3 });
+        Assert.Equal(expected, await dispatcher.ListAsync(token));
+    }
+
+    private sealed record WorkOrder(string Id, string Status, int LastEditDay);
+
+    [KineDbServerFact]
     public async Task Revoking_table_access_blocks_push_without_discarding_offline_write()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
