@@ -34,11 +34,21 @@ const { token } = await login.json();
 const session = { url: `ws://127.0.0.1:${port}/ws`, token };
 const pull = { ...session, live: false, pack: false };
 let dropNextReply = false;
+let holdNextSend = false;
 let dropReplyContaining;
 let matchingRepliesToDeliver = 0;
 let droppedReplies = 0;
 
 globalThis.WebSocket = class FaultInjectingWebSocket extends WebSocket {
+    send(data) {
+        if (holdNextSend) {
+            holdNextSend = false;
+            process.send('transaction-held');
+            return;
+        }
+        super.send(data);
+    }
+
     set onmessage(handler) {
         super.onmessage = event => {
             const containsMarker = dropReplyContaining && event.data instanceof ArrayBuffer &&
@@ -62,7 +72,9 @@ globalThis.WebSocket = class FaultInjectingWebSocket extends WebSocket {
 
 const { KineDB } = await import(pathToFileURL(join(packageDir, 'src/index.js')));
 const [mode, childDirectory, childTable] = process.argv.slice(3);
-assert.ok(!mode || mode === 'retention' || mode === 'paged' || (['lose-ack', 'restart-prepare', 'restart-verify'].includes(mode) && childDirectory && /^phase0_[a-f0-9]{16}$/.test(childTable)),
+assert.ok(!mode || ['retention', 'paged', 'billing'].includes(mode) ||
+    (['lose-ack', 'restart-prepare', 'restart-verify', 'billing-before', 'billing-after'].includes(mode) &&
+        childDirectory && /^phase0_[a-f0-9]{16}$/.test(childTable)),
     'Invalid replay worker arguments.');
 const table = childTable ?? ('phase0_' + randomBytes(8).toString('hex'));
 const query = `SELECT id, payload FROM ${table} ORDER BY id`;
@@ -89,6 +101,103 @@ async function server(sql) {
 
 async function local(db, expected) {
     assert.deepEqual((await db.sql(query)).data, expected);
+}
+
+const billingStatements = [
+    `UPDATE ${table}_sessions SET settled = settled + 1 WHERE id = 1`,
+    `INSERT INTO ${table}_bills (id, amount) VALUES (1, 125)`,
+    `INSERT INTO ${table}_payments (id, amount) VALUES (1, 125)`
+];
+const billingOptions = fault => ({ token: table + '-' + fault, retry: false });
+
+async function submitBillingFault() {
+    const db = open('billing-worker');
+    const connection = await db.connect(session.url, { token });
+    if (mode === 'billing-before') {
+        holdNextSend = true;
+        await connection.transaction(billingStatements, billingOptions(mode));
+        assert.fail('The transaction should have been held before sending.');
+    }
+    dropNextReply = true;
+    await assert.rejects(connection.transaction(billingStatements, billingOptions(mode)));
+    assert.equal(droppedReplies, 1);
+    process.send('transaction-reply-dropped');
+    await once(process, 'disconnect');
+}
+
+async function runBilling() {
+    const db = open('billing-observer');
+    const connection = await db.connect(session.url, { token });
+    async function state() {
+        // One statement observes all three records at the same server snapshot.
+        return (await server(`SELECT s.settled, b.amount, p.amount
+            FROM ${table}_sessions s
+            LEFT JOIN ${table}_bills b ON s.id = b.id
+            LEFT JOIN ${table}_payments p ON s.id = p.id`)).data;
+    }
+    try {
+        for (const fault of ['billing-before', 'billing-after', 'billing-concurrent']) {
+            await server(`CREATE TABLE ${table}_sessions (id INT PRIMARY KEY, settled INT)`);
+            await server(`CREATE TABLE ${table}_bills (id INT PRIMARY KEY, amount INT)`);
+            await server(`CREATE TABLE ${table}_payments (id INT PRIMARY KEY, amount INT)`);
+            await server(`INSERT INTO ${table}_sessions (id, settled) VALUES (1, 0)`);
+            try {
+                if (fault === 'billing-concurrent') {
+                    const peer = open('billing-peer');
+                    try {
+                        const other = await peer.connect(session.url, { token });
+                        const options = billingOptions(fault);
+                        await Promise.allSettled([
+                            connection.transaction(billingStatements, options),
+                            other.transaction(billingStatements, options)
+                        ]).then(results => {
+                            assert.deepEqual(results.map(result => result.status), ['fulfilled', 'fulfilled']);
+                        });
+                        assert.deepEqual(await state(), [[1, 125, 125]]);
+                        assert.deepEqual((await server(`SELECT COUNT(*) FROM ${table}_bills`)).data, [[1]]);
+                        assert.deepEqual((await server(`SELECT COUNT(*) FROM ${table}_payments`)).data, [[1]]);
+                        console.log('PASS: two concurrent submissions with the same token settled once');
+                    } finally {
+                        await peer.close();
+                    }
+                    continue;
+                }
+                if (fault === 'billing-before') {
+                    await assert.rejects(connection.transaction([
+                        ...billingStatements.slice(0, 2),
+                        `INSERT INTO ${table}_payments (id, missing_column) VALUES (1, 125)`
+                    ], { retry: false }));
+                    assert.deepEqual(await state(), [[0, null, null]]);
+                    console.log('PASS: rejected transaction left all three records unchanged');
+                }
+
+                const worker = fork(fileURLToPath(import.meta.url), [packageDir, fault, directory, table],
+                    { timeout: 30_000, killSignal: 'SIGKILL' });
+                const marker = fault === 'billing-before' ? 'transaction-held' : 'transaction-reply-dropped';
+                let killed = false;
+                worker.once('message', message => {
+                    if (message === marker) killed = worker.kill('SIGKILL');
+                });
+                const [, signal] = await once(worker, 'exit');
+                assert.ok(killed, 'Worker did not reach the fault point.');
+                assert.equal(signal, 'SIGKILL');
+                const committed = [[1, 125, 125]];
+                assert.deepEqual(await state(), fault === 'billing-before' ? [[0, null, null]] : committed);
+
+                for (let repeat = 0; repeat < 2; repeat++) {
+                    await connection.transaction(billingStatements, billingOptions(fault));
+                    assert.deepEqual(await state(), committed);
+                }
+                console.log(`PASS: ${fault}, two resends left one settlement, one bill and one payment`);
+            } finally {
+                for (const suffix of ['payments', 'bills', 'sessions'])
+                    await server(`DROP TABLE IF EXISTS ${table}_${suffix}`);
+            }
+        }
+    } finally {
+        await connection.close();
+        await db.close();
+    }
 }
 
 async function waitFor(predicate) {
@@ -523,7 +632,10 @@ try {
     else if (mode === 'restart-verify') await verifyServerRestart();
     else if (mode === 'retention') await runRetention();
     else if (mode === 'paged') await runPagedPull();
+    else if (mode === 'billing') await runBilling();
+    else if (mode === 'billing-before' || mode === 'billing-after') await submitBillingFault();
     else await runProbe();
 } finally {
-    if (!['lose-ack', 'restart-prepare'].includes(mode)) await rm(directory, { recursive: true, force: true });
+    if (!['lose-ack', 'restart-prepare', 'billing-before', 'billing-after'].includes(mode))
+        await rm(directory, { recursive: true, force: true });
 }

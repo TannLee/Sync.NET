@@ -10,6 +10,42 @@ namespace SyncDotNet.IntegrationTests;
 public sealed class Phase1Tests
 {
     [KineDbServerFact]
+    public async Task Billing_transaction_is_atomic_and_replays_once_after_client_failure()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var token = timeout.Token;
+        await using var server = await ProbeServer.StartAsync(token);
+        var start = new ProcessStartInfo("node")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../.."));
+        start.ArgumentList.Add(Path.Combine(root, "tools", "Sync.NET.Feasibility", "kinedb-sync-probe.mjs"));
+        start.ArgumentList.Add(Environment.GetEnvironmentVariable("SYNCNET_KINEDB_WASM_PACKAGE")!);
+        start.ArgumentList.Add("billing");
+        server.ConfigureProbe(start);
+        using var probe = Process.Start(start) ?? throw new IOException("Could not start billing probe.");
+        var stdout = probe.StandardOutput.ReadToEndAsync();
+        var stderr = probe.StandardError.ReadToEndAsync();
+        try
+        {
+            await probe.WaitForExitAsync(token);
+            Assert.True(probe.ExitCode == 0, (await stdout) + (await stderr));
+        }
+        finally
+        {
+            if (!probe.HasExited)
+            {
+                probe.Kill(entireProcessTree: true);
+                await probe.WaitForExitAsync();
+            }
+        }
+    }
+
+    [KineDbServerFact]
     public async Task Work_order_backlog_keeps_independent_edits_when_stale_edits_conflict()
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
@@ -475,6 +511,12 @@ public sealed class Phase1Tests
         private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
         private Process? _process;
         internal int Port => _http.BaseAddress!.Port;
+
+        internal void ConfigureProbe(ProcessStartInfo start)
+        {
+            start.Environment["KINEDB_ROOT_PASSWORD"] = _password;
+            start.Environment["SYNCNET_KINEDB_PORT"] = Port.ToString();
+        }
 
         internal static async Task<ProbeServer> StartAsync(CancellationToken token)
         {

@@ -179,7 +179,35 @@ $env:SYNCNET_KINEDB_SERVER_EXE = (Resolve-Path .phase0/kinedb-x86_64-pc-windows-
 dotnet test Sync.NET.slnx -c Release
 ```
 
-The preview passed **12/12 tests** on Windows x64, with **0 warnings and 0 errors** in the Release build. The suite covers two-replica convergence, persisted offline edits, conflicts, lost acknowledgments, schema checks, scope recovery, permission revocation and restoration, snapshot bootstrap and attachment round trips. The [feasibility probes](tools/Sync.NET.Feasibility) also cover interrupted and paged pulls, expired checkpoints, replay after server restart, and engine-level transactions across tables.
+The latest full Release run passed **14/14 tests** on Windows x64. The billing test also passed in a targeted run after the concurrent submission case was added. The [feasibility probes](tools/Sync.NET.Feasibility) cover additional cases such as interrupted pulls, expired checkpoints, and replay after server restart.
+
+### Offline work order backlog
+
+The test starts two replicas with 40 sample work orders. The technician makes 120 edits over three offline sessions and reopens the replica between sessions. The dispatcher updates five of the same work orders before the technician reconnects.
+
+On reconnect, the latest technician edits are applied to 35 work orders. The other five return conflicts, and the dispatcher versions remain on the server. All five refusals remain readable after reopening the technician replica. The next sync sends zero writes. The sessions run back to back to simulate a few days of edits. Actual elapsed time and dependent attachment handling are outside this case.
+
+### Billing transaction and replay
+
+The probe updates a session settlement counter and inserts a bill and a payment in one server transaction. It uses synthetic data and the pinned KineDB JavaScript client directly. The payment row represents a database record only.
+
+| Case | Verified result |
+| --- | --- |
+| Payment statement fails after the session and bill statements | The transaction is rejected. The session counter stays at zero and neither the bill nor the payment is stored. |
+| Client is killed before the held request reaches the server | The server state stays unchanged. The first resend commits all three changes. The second resend with the same token leaves the state unchanged. |
+| Server commits and the client is killed after the reply is dropped | All three changes are visible before retry. Two resends with the same token leave one settlement, one bill, and one payment. |
+| Two connections submit the same token concurrently | Both calls succeed. The server has one settlement, one bill, and one payment. |
+
+The pre-send case tests a client failure before delivery. Killing the server during transaction execution and deduplicating the same payment under different transaction tokens remain separate cases.
+
+Run the two scenarios individually after setting the environment variables above.
+
+```powershell
+dotnet test Sync.NET.slnx -c Release --filter "FullyQualifiedName~Work_order_backlog"
+dotnet test Sync.NET.slnx -c Release --filter "FullyQualifiedName~Billing_transaction"
+```
+
+### Benchmark
 
 With the test server running and `$package` set, run the benchmark:
 
