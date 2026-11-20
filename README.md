@@ -222,3 +222,8 @@ The benchmark creates a dedicated table and verifies convergence. A loopback run
 The tested deployment is Windows x64 with a Node/Wasm worker. Direct native integration in a .NET process, deployment on other platforms and installation on a separate clean machine remain unverified. Attachments have per-operation local limits, while an overall byte budget for a sync run remains open. The SDK preserves pending work when server access is revoked. Applications remain responsible for access to data already cached on a device.
 
 Check the terms for the KineDB runtime separately before redistribution. Supply the KineDB runtime separately when running the provider.
+
+## License
+
+Sync.NET is licensed under the [MIT License](LICENSE).
+KineDB and other third-party dependencies retain their respective licenses and terms.
